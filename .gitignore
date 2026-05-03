@@ -1,0 +1,5 @@
+node_modules/
+.imdb-user-data/
+imdb-lists.json
+imdb.csv
+.DS_Store
