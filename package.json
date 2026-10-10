@@ -5,9 +5,11 @@
   "private": true,
   "scripts": {
     "start": "node create-imdb-lists.mjs",
-    "postinstall": "playwright install chromium"
+    "postinstall": "playwright install chromium",
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "playwright": "^1.47.0"
+    "playwright": "^1.47.0",
+    "csv-parse": "5.6.0"
   }
 }

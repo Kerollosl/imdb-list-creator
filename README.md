@@ -108,3 +108,8 @@ Building IMDB lists by hand is tedious — clicking into each title, scrolling s
 ## License
 
 MIT — do whatever you want with it. Sign-in is yours, the lists are yours.
+
+
+## Cleanup behavior and validation limits
+
+CSV uses a real quoted-field parser. Only a unique exact normalized title/year suggestion is accepted; ambiguous items require review. Added status requires observed destination membership. List URL and progress are written atomically; live IMDb selectors still require account/browser verification.

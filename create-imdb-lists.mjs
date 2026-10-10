@@ -10,6 +10,8 @@
 
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import {parse} from 'csv-parse/sync';
+import {atomicJSON,chooseSuggestion} from './lib/reliability.mjs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -23,47 +25,13 @@ const ACTION_TIMEOUT = 20_000;
 const PER_ITEM_DELAY_MS = 1500;
 const PER_LIST_DELAY_MS = 4000;
 
-function parseCsvLine(line) {
-    const out = [];
-    let cur = '';
-    let inQuotes = false;
-    for (let i = 0; i < line.length; i++) {
-        const c = line[i];
-        if (inQuotes) {
-            if (c === '"') {
-                if (line[i + 1] === '"') {
-                    cur += '"';
-                    i++;
-                } else {
-                    inQuotes = false;
-                }
-            } else {
-                cur += c;
-            }
-        } else {
-            if (c === '"') inQuotes = true;
-            else if (c === ',') {
-                out.push(cur);
-                cur = '';
-            } else cur += c;
-        }
-    }
-    out.push(cur);
-    return out;
-}
-
 function parseCsv(content) {
-    const lines = content.split(/\r?\n/).filter((l) => l.trim().length);
-    const rows = [];
-    for (let i = 1; i < lines.length; i++) {
-        const fields = parseCsvLine(lines[i]);
-        if (fields.length < 3) continue;
-        // CSV has duplicate columns: the last three are the clean ones.
-        const [title, year, category] = fields.slice(-3).map((s) => s.trim());
-        if (!title || !category) continue;
-        rows.push({ title, year, category });
-    }
-    return rows;
+ const rows=parse(content,{skip_empty_lines:true,relax_column_count:true,bom:true});
+ return rows.slice(1).flatMap(fields=>{
+  if(fields.length<3)return [];
+  const [title,year,category]=fields.slice(-3).map(s=>s.trim());
+  return title&&category?[{title,year,category}]:[];
+ });
 }
 
 function groupByCategory(rows) {
@@ -188,40 +156,21 @@ async function addTitleToList(page, listUrl, { title, year }) {
     const count = await options.count();
     if (count === 0) throw new Error('no suggestion options');
 
-    const titleLower = title.toLowerCase();
-    let chosen = -1;
-    if (year) {
-        let yearMatchIdx = -1;
-        for (let i = 0; i < count; i++) {
-            const text = ((await options.nth(i).innerText()) || '').trim();
-            const tLower = text.toLowerCase();
-            const yearOk = text.includes(`(${year})`);
-            const startsOk = tLower.startsWith(titleLower);
-            if (yearOk && startsOk) {
-                chosen = i;
-                break;
-            }
-            if (yearOk && yearMatchIdx === -1) yearMatchIdx = i;
-        }
-        if (chosen === -1) chosen = yearMatchIdx;
-    }
-    if (chosen === -1) {
-        // Fall back to first suggestion whose title text starts with the query.
-        for (let i = 0; i < count; i++) {
-            const t = ((await options.nth(i).innerText()) || '').trim().toLowerCase();
-            if (t.startsWith(titleLower)) {
-                chosen = i;
-                break;
-            }
-        }
-    }
-    if (chosen === -1) chosen = 0;
-
+    const candidates=[];
+    for(let i=0;i<count;i++)candidates.push(await options.nth(i).innerText());
+    const chosen=chooseSuggestion(candidates,title,year);
     const chosenText = ((await options.nth(chosen).innerText()) || '').trim();
+    const href=await options.nth(chosen).locator('a[href*="/title/tt"]').first().getAttribute('href').catch(()=>null);
+    const matchedId=href?.match(/\/title\/(tt\d+)/)?.[1];
+    if(!matchedId)throw Error('Suggestion has no verifiable IMDb title ID');
+    const existing=page.locator(`.ipc-metadata-list-summary-item a[href*="/title/${matchedId}/"], .lister-item a[href*="/title/${matchedId}/"]`);
+    if(await existing.count()){ await input.fill(''); return chosenText; }
     await options.nth(chosen).click();
     // Allow the add request to complete; the dropdown closes after a successful add.
-    await page.waitForTimeout(900);
-    return chosenText;
+    await list.waitFor({state:'hidden',timeout:ACTION_TIMEOUT});
+    const rows=page.locator('li.ipc-metadata-list-summary-item, [data-testid="list-item"], .lister-item');
+    await rows.filter({has:page.locator(`a[href*="/title/${matchedId}/"]`)}).first().waitFor({state:'visible',timeout:ACTION_TIMEOUT});
+    return `${matchedId}: ${chosenText}`;
 }
 
 async function main() {
@@ -247,6 +196,7 @@ async function main() {
     ctx.setDefaultNavigationTimeout(NAV_TIMEOUT);
     const page = ctx.pages()[0] || (await ctx.newPage());
 
+    try {
     await ensureSignedIn(ctx, page);
 
     const previous = fs.existsSync(OUTPUT_PATH) ? JSON.parse(fs.readFileSync(OUTPUT_PATH, 'utf8')) : {};
@@ -270,10 +220,11 @@ async function main() {
             } catch (err) {
                 console.warn(`    ! Failed to create list for ${category}:`, err.message);
                 results[category] = { url: null, error: err.message, items: items.map((i) => ({ ...i, status: 'skipped' })) };
-                fs.writeFileSync(OUTPUT_PATH, JSON.stringify(results, null, 2));
+                atomicJSON(OUTPUT_PATH,results);
                 continue;
             }
             results[category] = { url: listUrl, items: [] };
+            atomicJSON(OUTPUT_PATH,results);
         } else {
             console.log(`\n=== Resuming list: ${category} -> ${listUrl} ===`);
             results[category].items = results[category].items || [];
@@ -292,12 +243,13 @@ async function main() {
             try {
                 const matchedText = await addTitleToList(page, listUrl, item);
                 results[category].items.push({ ...item, status: 'added', matched: matchedText });
+                alreadyAdded.add(key);
                 console.log(`    + ${item.title} (${item.year}) -> ${matchedText}`);
             } catch (err) {
                 results[category].items.push({ ...item, status: 'failed', error: err.message });
                 console.warn(`    ! ${item.title} (${item.year}): ${err.message}`);
             }
-            fs.writeFileSync(OUTPUT_PATH, JSON.stringify(results, null, 2));
+            atomicJSON(OUTPUT_PATH,results);
             await page.waitForTimeout(PER_ITEM_DELAY_MS);
         }
 
@@ -310,10 +262,11 @@ async function main() {
         if (res.url) console.log(`  ${cat}: ${res.url}`);
     }
 
-    await ctx.close();
+    } finally { await ctx.close(); }
 }
 
 main().catch((err) => {
     console.error('Fatal:', err);
     process.exit(1);
 });
+
